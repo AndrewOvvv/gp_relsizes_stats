@@ -18,7 +18,9 @@
 #include "tcop/utility.h"
 
 #include "cdb/cdbvars.h"
+#include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "executor/spi.h"
 #include "funcapi.h"
 
@@ -26,6 +28,7 @@
 #include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
 #include <sys/stat.h>
@@ -54,10 +57,15 @@ void _PG_fini(void);
 /* flags set by signal handlers */
 
 /* GUC variables */
-static int worker_restart_naptime = 0;  /* set up in _PG_init() function */
-static int worker_database_naptime = 0; /* set up in _PG_init() function */
-static int worker_file_naptime = 0;     /* set up in _PG_init() function */
-static bool extension_enabled = false;  /* set up in _PG_init() function */
+static int worker_restart_naptime = 0; /* set up in _PG_init() function */
+static int worker_file_naptime = 0;    /* set up in _PG_init() function */
+static bool extension_enabled = false; /* set up in _PG_init() function */
+
+/* define structures */
+typedef struct {
+    char *dbname;
+    int dboid;
+} DatabaseWorkerArgs;
 
 static void worker_sigterm(SIGNAL_ARGS) {
     int save_errno = errno;
@@ -65,6 +73,55 @@ static void worker_sigterm(SIGNAL_ARGS) {
         SetLatch(&MyProc->procLatch);
     }
     errno = save_errno;
+}
+
+/*
+ * Wait for a background worker to stop.
+ *
+ * If the worker hasn't yet started, or is running, we wait for it to stop
+ * and then return BGWH_STOPPED.  However, if the postmaster has died, we give
+ * up and return BGWH_POSTMASTER_DIED, because it's the postmaster that
+ * notifies us when a worker's state changes.
+ */
+static BgwHandleStatus WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
+{
+	BgwHandleStatus status;
+	int			rc;
+	bool		save_set_latch_on_sigusr1;
+
+	save_set_latch_on_sigusr1 = set_latch_on_sigusr1;
+	set_latch_on_sigusr1 = true;
+
+	PG_TRY();
+	{
+		for (;;)
+		{
+			pid_t		pid;
+
+			CHECK_FOR_INTERRUPTS();
+
+			status = GetBackgroundWorkerPid(handle, &pid);
+			if (status == BGWH_STOPPED)
+				return status;
+
+			rc = WaitLatch(&MyProc->procLatch,
+						   WL_LATCH_SET | WL_POSTMASTER_DEATH, 0);
+
+			if (rc & WL_POSTMASTER_DEATH)
+				return BGWH_POSTMASTER_DIED;
+
+			ResetLatch(&MyProc->procLatch);
+		}
+	}
+	PG_CATCH();
+	{
+		set_latch_on_sigusr1 = save_set_latch_on_sigusr1;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	set_latch_on_sigusr1 = save_set_latch_on_sigusr1;
+	return status;
 }
 
 static Datum *get_databases_oids(int *databases_cnt, MemoryContext ctx) {
@@ -79,7 +136,6 @@ static Datum *get_databases_oids(int *databases_cnt, MemoryContext ctx) {
     /* get timestamp and start transaction */
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
-
     /* connect to spi */
     retcode = SPI_connect();
     if (retcode < 0) { /* error */
@@ -87,11 +143,11 @@ static Datum *get_databases_oids(int *databases_cnt, MemoryContext ctx) {
         goto finish_transaction;
     }
     PushActiveSnapshot(GetTransactionSnapshot());
-    pgstat_report_activity(STATE_RUNNING, sql);
 
+    /* update report activity */
+    pgstat_report_activity(STATE_RUNNING, sql);
     /* execute sql query to get table */
     retcode = SPI_execute(sql, true, 0);
-
     /* check errors if they're occured during execution */
     if (retcode != SPI_OK_SELECT || SPI_processed < 0) { /* error */
         error = "get_databases_oids: SPI_execute failed (select datname, oid)";
@@ -157,7 +213,6 @@ static int update_segment_file_map_table() {
     /* get timestamp and start transaction */
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
-
     /* connect to SPI */
     retcode = SPI_connect();
     if (retcode < 0) { /* error */
@@ -333,67 +388,58 @@ finish_data:
     return (Datum)0;
 }
 
-static void get_stats_for_databases(Datum *databases_oids, int databases_cnt) {
+static void stats_for_database_collector(Datum main_arg) {
     int retcode = 0;
     char *sql = NULL;
     char *error = NULL;
 
-    for (int i = 0; i < databases_cnt; ++i) {
-        /* get timestamp and start transaction */
-        SetCurrentStatementStartTimestamp();
-        StartTransactionCommand();
+    /* get arguments from datum main_arg */
+    DatabaseWorkerArgs *args = (DatabaseWorkerArgs *)DatumGetPointer(main_arg);
+    char *dbname = args->dbname;
+    int dboid = args->dboid;
 
-        /* connect to SPI */
-        retcode = SPI_connect();
-        if (retcode < 0) { /* error */
-            error = "get_stats_for_databases: SPI_connect failed";
-            goto finish_transaction;
-        }
-        PushActiveSnapshot(GetTransactionSnapshot());
+    /* connect to specified database */
+    BackgroundWorkerInitializeConnection(dbname, NULL);
 
-        char *dbname = NameStr(*DatumGetName(databases_oids[2 * i]));
-        int dboid = DatumGetInt32(databases_oids[2 * i + 1]);
-
-        sql = psprintf("SELECT 1 FROM pg_database WHERE oid = %d AND datname = '%s'", dboid, dbname);
-        pgstat_report_activity(STATE_RUNNING, sql);
-
-        retcode = SPI_execute(sql, true, 0);
-        if (retcode != SPI_OK_SELECT || SPI_processed < 0) { /* error */
-            error = "get_stats_for_databases: SPI_execute failed (failed to check if database exists)";
-            goto finish_spi;
-        }
-
-        if (SPI_processed == 0) {
-            continue;
-        }
-
-        pfree(sql);
-        sql = psprintf("INSERT INTO mdb_toolkit.segment_file_sizes (segment, relfilenode, filepath, size, mtime) "
-                       "SELECT * FROM get_stats_for_database(%d)",
-                       dboid);
-        pgstat_report_activity(STATE_RUNNING, sql);
-        retcode = SPI_execute(sql, false, 0);
-        if (retcode != SPI_OK_INSERT) {
-            error = "get_stats_for_databases: SPI_execute failed (insert into segment_file_sizes)";
-            goto finish_spi;
-        }
-
-        SPI_finish();
-        PopActiveSnapshot();
-        CommitTransactionCommand();
-        pgstat_report_stat(false);
-        pgstat_report_activity(STATE_IDLE, NULL);
-
-        retcode = WaitLatch(&MyProc->procLatch, WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-                            (worker_database_naptime / databases_cnt));
-        ResetLatch(&MyProc->procLatch);
-
-        /* emergency bailout if postmaster has died */
-        if (retcode & WL_POSTMASTER_DEATH) {
-            proc_exit(1);
-        }
+    /* get timestamp and start transaction */
+    SetCurrentStatementStartTimestamp();
+    StartTransactionCommand();
+    /* connect to SPI */
+    retcode = SPI_connect();
+    if (retcode < 0) { /* error */
+        error = "get_stats_for_databases: SPI_connect failed";
+        goto finish_transaction;
     }
-    return;
+    PushActiveSnapshot(GetTransactionSnapshot());
+
+    sql = psprintf("SELECT 1 FROM pg_database WHERE oid = %d AND datname = '%s'", dboid, dbname);
+    /* update report activity */
+    pgstat_report_activity(STATE_RUNNING, sql);
+    /* check that database exists */
+    retcode = SPI_execute(sql, true, 0);
+    if (retcode != SPI_OK_SELECT || SPI_processed < 0) { /* error */
+        error = "get_stats_for_databases: SPI_execute failed (failed to check if database exists)";
+        goto finish_spi;
+    }
+    pfree(sql);
+
+    sql = psprintf("INSERT INTO mdb_toolkit.segment_file_sizes (segment, relfilenode, filepath, size, mtime) "
+                   "SELECT * FROM get_stats_for_database(%d)",
+                   dboid);
+    /* update report activity */
+    pgstat_report_activity(STATE_RUNNING, sql);
+    /* start file sizes collecting */
+    retcode = SPI_execute(sql, false, 0);
+    if (retcode != SPI_OK_INSERT) {
+        error = "get_stats_for_databases: SPI_execute failed (insert into segment_file_sizes)";
+        goto finish_spi;
+    }
+
+    SPI_finish();
+    PopActiveSnapshot();
+    CommitTransactionCommand();
+    pgstat_report_stat(false);
+    pgstat_report_activity(STATE_IDLE, NULL);
 finish_spi:
     SPI_finish();
 finish_transaction:
@@ -408,6 +454,47 @@ finish_transaction:
 
     if (error != NULL) {
         ereport(ERROR, (errmsg("%s: %m", error)));
+    }
+}
+
+static void get_stats_for_databases(Datum *databases_oids, int databases_cnt) {
+    DatabaseWorkerArgs *args = (DatabaseWorkerArgs *)MemoryContextAlloc(
+        TopMemoryContext, sizeof(DatabaseWorkerArgs)); // TODO remove top memory context
+    BackgroundWorkerHandle *handle;
+    BgwHandleStatus status;
+
+    for (int i = 0; i < databases_cnt; ++i) {
+        args->dbname = NameStr(*DatumGetName(databases_oids[2 * i]));
+        args->dboid = DatumGetInt32(databases_oids[2 * i + 1]);
+
+        /* allocate shared memory, start background workers, etc */
+        BackgroundWorker database_worker;
+        /* set up common data for our worker */
+        memset(&database_worker, 0, sizeof(database_worker));
+        database_worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+        database_worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+        database_worker.bgw_restart_time = BGW_NEVER_RESTART;
+        database_worker.bgw_main = stats_for_database_collector;
+        database_worker.bgw_notify_pid = 0;
+        database_worker.bgw_main_arg = PointerGetDatum(args);
+        database_worker.bgw_start_rule = NULL;
+        /* Fill in worker-specific data, and do the actual registrations. */
+        snprintf(database_worker.bgw_name, BGW_MAXLEN, "database_stats_collector_worker");
+
+        RegisterDynamicBackgroundWorker(&database_worker, &handle);
+
+        pid_t       pid;
+        status = WaitForBackgroundWorkerStartup(handle, &pid);
+        if (status != BGWH_STARTED) {
+            ereport(ERROR, (errmsg("postmaster died while starting/executing background worker [%s]",
+                                   database_worker.bgw_name)));
+        }
+
+        status = WaitForBackgroundWorkerShutdown(handle);
+        if (status != BGWH_STOPPED) {
+            ereport(ERROR, (errmsg("postmaster died while starting/executing background worker [%s]",
+                                   database_worker.bgw_name)));
+        }
     }
 }
 
@@ -426,15 +513,17 @@ static bool plugin_created() {
         goto finish_transaction;
     }
     PushActiveSnapshot(GetTransactionSnapshot());
-    pgstat_report_activity(STATE_RUNNING, sql);
 
+    /* update report activity */
+    pgstat_report_activity(STATE_RUNNING, sql);
+    /* check that plugin created */
     retcode = SPI_execute(sql, true, 0);
     if (retcode != SPI_OK_SELECT || SPI_processed < 0) { /* error */
         error = "plugin_created: SPI_execute failed (failed to check if plugin created)";
         goto finish_spi;
     }
-
     retcode = SPI_processed;
+
 finish_spi:
     SPI_finish();
 finish_transaction:
@@ -470,6 +559,7 @@ static void put_collected_data_into_history() {
 
     /* update report activity */
     pgstat_report_activity(STATE_RUNNING, sql_insert);
+    /* actual put data into history table */
     retcode = SPI_execute(sql_insert, false, 0);
     if (retcode != SPI_OK_INSERT || SPI_processed < 0) { /* error */
         error = "put_collected_data_into_history: SPI_execute failed (failed to insert data into history table)";
@@ -478,6 +568,7 @@ static void put_collected_data_into_history() {
 
     /* update report activity */
     pgstat_report_activity(STATE_RUNNING, sql_truncate);
+    /* truncate actual data */
     retcode = SPI_execute(sql_truncate, false, 0);
     if (retcode != SPI_OK_UTILITY || SPI_processed < 0) { /* error */
         error = "put_collected_data_into_history: SPI_execute failed (failed to truncate actual table)";
@@ -554,19 +645,15 @@ void collect_stats(Datum main_arg) {
 
 void _PG_init(void) {
     /* define GUC extension enable flag */
-    DefineCustomBoolVariable("gp_relsizes_stats.enabled", "Enable extension flag", NULL, &extension_enabled, false,
+    DefineCustomBoolVariable("gp_relsizes_stats.enabled", "Enable extension flag", NULL, &extension_enabled, true,
                              PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
     /* define GUC naptime variables */
     DefineCustomIntVariable("gp_relsizes_stats.restart_naptime", "Duration between every collect-phases (in sec).",
                             NULL, &worker_restart_naptime,
-                            6 * HOUR_TIME, /* set naptime between check-phase (in seconds) */
-                            1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("gp_relsizes_stats.database_naptime", "Duration between collect-phase for db (in sec).",
-                            NULL, &worker_database_naptime,
-                            30 * MINUTE_TIME, /* set naptime between collecting stats of databases (in seconds) */
+                            MINUTE_TIME, /* set naptime between check-phase (in ms) */
                             1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
     DefineCustomIntVariable("gp_relsizes_stats.file_naptime", "Duration between each collect-phase for files (in sec).",
-                            NULL, &worker_file_naptime, FILE_NAPTIME, /* set naptime between check-phase (in seconds) */
+                            NULL, &worker_file_naptime, FILE_NAPTIME, /* set naptime between check-phase (in ms) */
                             1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
     if (!process_shared_preload_libraries_in_progress) {
@@ -587,6 +674,7 @@ void _PG_init(void) {
     /* Fill in worker-specific data, and do the actual registrations. */
     snprintf(worker.bgw_name, BGW_MAXLEN, "gp_relsizes_stats_worker");
     worker.bgw_main_arg = Int32GetDatum(0);
+
     RegisterBackgroundWorker(&worker);
 }
 
