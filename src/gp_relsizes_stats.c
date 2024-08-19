@@ -486,13 +486,13 @@ static void get_stats_for_databases(Datum *databases_oids, int databases_cnt) {
         pid_t       pid;
         status = WaitForBackgroundWorkerStartup(handle, &pid);
         if (status != BGWH_STARTED) {
-            ereport(ERROR, (errmsg("postmaster died while starting/executing background worker [%s]",
+            ereport(ERROR, (errmsg("postmaster died while starting background worker [%s]",
                                    database_worker.bgw_name)));
         }
 
         status = WaitForBackgroundWorkerShutdown(handle);
         if (status != BGWH_STOPPED) {
-            ereport(ERROR, (errmsg("postmaster died while starting/executing background worker [%s]",
+            ereport(ERROR, (errmsg("postmaster died while executing background worker [%s]",
                                    database_worker.bgw_name)));
         }
     }
@@ -648,11 +648,11 @@ void _PG_init(void) {
     DefineCustomBoolVariable("gp_relsizes_stats.enabled", "Enable extension flag", NULL, &extension_enabled, true,
                              PGC_SIGHUP, GUC_NOT_IN_SAMPLE, NULL, NULL, NULL);
     /* define GUC naptime variables */
-    DefineCustomIntVariable("gp_relsizes_stats.restart_naptime", "Duration between every collect-phases (in sec).",
+    DefineCustomIntVariable("gp_relsizes_stats.restart_naptime", "Duration between every collect-phases (in ms).",
                             NULL, &worker_restart_naptime,
                             MINUTE_TIME, /* set naptime between check-phase (in ms) */
                             1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
-    DefineCustomIntVariable("gp_relsizes_stats.file_naptime", "Duration between each collect-phase for files (in sec).",
+    DefineCustomIntVariable("gp_relsizes_stats.file_naptime", "Duration between each collect-phase for files (in ms).",
                             NULL, &worker_file_naptime, FILE_NAPTIME, /* set naptime between check-phase (in ms) */
                             1, INT_MAX, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
